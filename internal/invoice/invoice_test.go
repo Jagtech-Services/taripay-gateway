@@ -483,3 +483,251 @@ func TestExpireStale(t *testing.T) {
 		}
 	}
 }
+
+// ---- Ootle L2 support tests (task brief "Ootle L2 stablecoin/native-resource
+// payment support in taripay-gateway") ----
+
+// TestCreateOotle_InsertsRowWithInstantiatedComponent covers CreateOotle's happy path
+// and the new columns' round-trip through the DB (task brief section 6: "new column
+// scan round-trip"): Chain/OotleComponentAddress/OotleResourceAddress/
+// OotleTrapdoorFlagged must all come back exactly as inserted via GetByID (which goes
+// through the same shared scanInvoice/invoiceColumns every other Store method uses).
+func TestCreateOotle_InsertsRowWithInstantiatedComponent(t *testing.T) {
+	s := setupStore(t, nil)
+	ctx := context.Background()
+
+	wantComponent := "component_deadbeef00000000000000000000000000000000000000000000000000000000"
+	wantResource := "resource_0102030000000000000000000000000000000000000000000000000000000000"
+	var gotPaymentID, gotResourceAddress string
+	var gotAmount uint64
+	instantiate := func(ctx context.Context, paymentID string, resourceAddress string, expectedAmount uint64) (string, error) {
+		gotPaymentID = paymentID
+		gotResourceAddress = resourceAddress
+		gotAmount = expectedAmount
+		return wantComponent, nil
+	}
+
+	inv, err := s.CreateOotle(ctx, "order-ootle-1", wantResource, 750_000, 30*time.Minute, instantiate)
+	if err != nil {
+		t.Fatalf("CreateOotle() error = %v", err)
+	}
+
+	if gotPaymentID != inv.PaymentID {
+		t.Errorf("instantiate called with paymentID = %q, want %q", gotPaymentID, inv.PaymentID)
+	}
+	if gotResourceAddress != wantResource {
+		t.Errorf("instantiate called with resourceAddress = %q, want %q", gotResourceAddress, wantResource)
+	}
+	if gotAmount != 750_000 {
+		t.Errorf("instantiate called with expectedAmount = %d, want 750000", gotAmount)
+	}
+
+	if inv.Chain != ChainOotle {
+		t.Errorf("Chain = %q, want %q", inv.Chain, ChainOotle)
+	}
+	if inv.OotleComponentAddress == nil || *inv.OotleComponentAddress != wantComponent {
+		t.Errorf("OotleComponentAddress = %v, want %q", inv.OotleComponentAddress, wantComponent)
+	}
+	if inv.OotleResourceAddress == nil || *inv.OotleResourceAddress != wantResource {
+		t.Errorf("OotleResourceAddress = %v, want %q", inv.OotleResourceAddress, wantResource)
+	}
+	if inv.OotleTrapdoorFlagged {
+		t.Errorf("OotleTrapdoorFlagged = true on creation, want false")
+	}
+	if inv.Status != StatusPending {
+		t.Errorf("Status = %q, want %q", inv.Status, StatusPending)
+	}
+
+	// Round-trip through the DB via GetByID confirms the new columns were
+	// actually persisted (not just returned in-memory from CreateOotle itself).
+	got, err := s.GetByID(ctx, inv.ID)
+	if err != nil {
+		t.Fatalf("GetByID() error = %v", err)
+	}
+	if got.Chain != ChainOotle {
+		t.Errorf("GetByID().Chain = %q, want %q", got.Chain, ChainOotle)
+	}
+	if got.OotleComponentAddress == nil || *got.OotleComponentAddress != wantComponent {
+		t.Errorf("GetByID().OotleComponentAddress = %v, want %q", got.OotleComponentAddress, wantComponent)
+	}
+	if got.OotleResourceAddress == nil || *got.OotleResourceAddress != wantResource {
+		t.Errorf("GetByID().OotleResourceAddress = %v, want %q", got.OotleResourceAddress, wantResource)
+	}
+	if got.OotleTrapdoorFlagged {
+		t.Errorf("GetByID().OotleTrapdoorFlagged = true, want false")
+	}
+}
+
+// TestCreateOotle_InstantiationFailureInsertsNoRow mirrors
+// TestCreate_WalletResolutionFailureInsertsNoRow's L1 precedent: if the injected
+// instantiate func fails, no row is inserted at all — no orphan Ootle invoices with
+// no on-chain component.
+func TestCreateOotle_InstantiationFailureInsertsNoRow(t *testing.T) {
+	s := setupStore(t, nil)
+	ctx := context.Background()
+
+	wantErr := errors.New("ootlepay: indexer unreachable")
+	instantiate := func(ctx context.Context, paymentID string, resourceAddress string, expectedAmount uint64) (string, error) {
+		return "", wantErr
+	}
+
+	_, err := s.CreateOotle(ctx, "order-ootle-fail", "resource_00", 1000, time.Minute, instantiate)
+	if err == nil {
+		t.Fatal("CreateOotle() error = nil, want an error when instantiation fails")
+	}
+	if !errors.Is(err, wantErr) {
+		t.Errorf("CreateOotle() error = %v, want it to wrap %v", err, wantErr)
+	}
+
+	var count int
+	if err := s.db.QueryRow(ctx, `SELECT count(*) FROM invoices WHERE order_ref = $1`, "order-ootle-fail").Scan(&count); err != nil {
+		t.Fatalf("count query: %v", err)
+	}
+	if count != 0 {
+		t.Errorf("invoices with order_ref=order-ootle-fail = %d, want 0 (no orphan row on instantiation failure)", count)
+	}
+}
+
+// TestCreateOotle_IdempotentWhileNonTerminal mirrors
+// TestCreate_IdempotentWhileNonTerminal's L1 precedent for CreateOotle: two calls with
+// the same order_ref while the first invoice is still non-terminal must return the
+// SAME invoice, without calling instantiate a second time (no second on-chain
+// component minted for the same order).
+func TestCreateOotle_IdempotentWhileNonTerminal(t *testing.T) {
+	s := setupStore(t, nil)
+	ctx := context.Background()
+
+	calls := 0
+	instantiate := func(ctx context.Context, paymentID string, resourceAddress string, expectedAmount uint64) (string, error) {
+		calls++
+		return "component_" + paymentID, nil
+	}
+
+	first, err := s.CreateOotle(ctx, "order-ootle-idempotent", "resource_00", 1000, time.Hour, instantiate)
+	if err != nil {
+		t.Fatalf("CreateOotle() #1 error = %v", err)
+	}
+
+	second, err := s.CreateOotle(ctx, "order-ootle-idempotent", "resource_11", 9999, time.Hour, instantiate)
+	if err != nil {
+		t.Fatalf("CreateOotle() #2 error = %v", err)
+	}
+	if second.ID != first.ID {
+		t.Errorf("CreateOotle() #2 ID = %v, want it to equal CreateOotle() #1's ID %v (idempotent retry must return the same invoice)", second.ID, first.ID)
+	}
+	if calls != 1 {
+		t.Errorf("instantiate called %d time(s), want 1 (idempotent retry must not instantiate a second on-chain component)", calls)
+	}
+
+	var count int
+	if err := s.db.QueryRow(ctx, `SELECT count(*) FROM invoices WHERE order_ref = $1`, "order-ootle-idempotent").Scan(&count); err != nil {
+		t.Fatalf("count query: %v", err)
+	}
+	if count != 1 {
+		t.Errorf("invoices with order_ref=order-ootle-idempotent = %d, want 1 (no second row created)", count)
+	}
+}
+
+// TestFlagTrapdoor_And_ClearTrapdoor covers both new methods (task brief section 6):
+// FlagTrapdoor sets the column true (and is idempotent), ClearTrapdoor sets it back
+// false, and both return ErrNotFound for an unknown id.
+func TestFlagTrapdoor_And_ClearTrapdoor(t *testing.T) {
+	s := setupStore(t, nil)
+	ctx := context.Background()
+
+	instantiate := func(ctx context.Context, paymentID string, resourceAddress string, expectedAmount uint64) (string, error) {
+		return "component_" + paymentID, nil
+	}
+	inv, err := s.CreateOotle(ctx, "order-trapdoor", "resource_00", 1000, time.Hour, instantiate)
+	if err != nil {
+		t.Fatalf("CreateOotle() error = %v", err)
+	}
+	if inv.OotleTrapdoorFlagged {
+		t.Fatalf("OotleTrapdoorFlagged on creation = true, want false")
+	}
+
+	if err := s.FlagTrapdoor(ctx, inv.ID); err != nil {
+		t.Fatalf("FlagTrapdoor() error = %v", err)
+	}
+	got, err := s.GetByID(ctx, inv.ID)
+	if err != nil {
+		t.Fatalf("GetByID() error = %v", err)
+	}
+	if !got.OotleTrapdoorFlagged {
+		t.Errorf("OotleTrapdoorFlagged after FlagTrapdoor() = false, want true")
+	}
+
+	// Idempotent: flagging an already-flagged invoice again is a harmless no-op.
+	if err := s.FlagTrapdoor(ctx, inv.ID); err != nil {
+		t.Fatalf("FlagTrapdoor() (second call) error = %v", err)
+	}
+
+	if err := s.ClearTrapdoor(ctx, inv.ID); err != nil {
+		t.Fatalf("ClearTrapdoor() error = %v", err)
+	}
+	got, err = s.GetByID(ctx, inv.ID)
+	if err != nil {
+		t.Fatalf("GetByID() error = %v", err)
+	}
+	if got.OotleTrapdoorFlagged {
+		t.Errorf("OotleTrapdoorFlagged after ClearTrapdoor() = true, want false")
+	}
+
+	if err := s.FlagTrapdoor(ctx, uuid.New()); !errors.Is(err, ErrNotFound) {
+		t.Errorf("FlagTrapdoor(unknown id) error = %v, want ErrNotFound", err)
+	}
+	if err := s.ClearTrapdoor(ctx, uuid.New()); !errors.Is(err, ErrNotFound) {
+		t.Errorf("ClearTrapdoor(unknown id) error = %v, want ErrNotFound", err)
+	}
+}
+
+// TestListNonTerminalOotle covers the Ootle-scoped ListNonTerminalOotle: it must
+// return only chain='ootle' non-terminal invoices, excluding both L1 invoices AND
+// terminal Ootle invoices.
+func TestListNonTerminalOotle(t *testing.T) {
+	s := setupStore(t, nil)
+	ctx := context.Background()
+
+	instantiate := func(ctx context.Context, paymentID string, resourceAddress string, expectedAmount uint64) (string, error) {
+		return "component_" + paymentID, nil
+	}
+
+	ootlePending, err := s.CreateOotle(ctx, "order-ootle-list-pending", "resource_00", 100, time.Hour, instantiate)
+	if err != nil {
+		t.Fatalf("CreateOotle(pending) error = %v", err)
+	}
+	ootleConfirmed, err := s.CreateOotle(ctx, "order-ootle-list-confirmed", "resource_00", 100, time.Hour, instantiate)
+	if err != nil {
+		t.Fatalf("CreateOotle(confirmed) error = %v", err)
+	}
+	if err := s.UpdateStatus(ctx, ootleConfirmed.ID, StatusConfirmed, nil); err != nil {
+		t.Fatalf("UpdateStatus(confirmed): %v", err)
+	}
+	l1Pending, err := s.Create(ctx, "order-l1-list-pending", 100, time.Hour)
+	if err != nil {
+		t.Fatalf("Create(l1 pending) error = %v", err)
+	}
+
+	got, err := s.ListNonTerminalOotle(ctx)
+	if err != nil {
+		t.Fatalf("ListNonTerminalOotle() error = %v", err)
+	}
+
+	gotIDs := map[uuid.UUID]bool{}
+	for _, inv := range got {
+		if inv.Chain != ChainOotle {
+			t.Errorf("ListNonTerminalOotle() returned a non-ootle invoice %s (chain=%q)", inv.ID, inv.Chain)
+		}
+		gotIDs[inv.ID] = true
+	}
+
+	if !gotIDs[ootlePending.ID] {
+		t.Errorf("ListNonTerminalOotle() missing non-terminal ootle invoice %s", ootlePending.ID)
+	}
+	if gotIDs[ootleConfirmed.ID] {
+		t.Errorf("ListNonTerminalOotle() should not include terminal ootle invoice %s", ootleConfirmed.ID)
+	}
+	if gotIDs[l1Pending.ID] {
+		t.Errorf("ListNonTerminalOotle() should not include L1 invoice %s", l1Pending.ID)
+	}
+}

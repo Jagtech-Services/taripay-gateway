@@ -20,6 +20,9 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/tari-project/ootle-go/ootle"
+	"github.com/tari-project/ootle-go/transport"
+
 	"github.com/Snipa22/go-tari-grpc-lib/v3/tari_generated"
 	"github.com/Snipa22/go-tari-lib/walletGRPC"
 
@@ -28,6 +31,7 @@ import (
 	"github.com/Snipa22/taripay-gateway/internal/db"
 	"github.com/Snipa22/taripay-gateway/internal/eventwatcher"
 	"github.com/Snipa22/taripay-gateway/internal/invoice"
+	"github.com/Snipa22/taripay-gateway/internal/ootlepay"
 	"github.com/Snipa22/taripay-gateway/internal/webhook"
 )
 
@@ -67,6 +71,13 @@ const webhookRetryTickerInterval = 60 * time.Second
 // race this interval alone can't (a payment landing in the exact window between
 // expires_at passing and the next sweep tick).
 const ttlSweepTickerInterval = 60 * time.Second
+
+// ootlePollTickerInterval is how often runOotlePollLoop below calls
+// watcher.PollOotleInvoices (task brief "Ootle L2 stablecoin/native-resource payment
+// support in taripay-gateway", section 4). PLACEHOLDER, UNCONFIRMED value, same
+// "reasonable-sounding guess, not project-owner-approved" caveat as
+// ttlSweepTickerInterval/webhookRetryTickerInterval above.
+const ootlePollTickerInterval = 60 * time.Second
 
 // maxInvoiceBodyBytes caps POST /invoice's request body via http.MaxBytesReader
 // (task brief part 2, security-boundaries persona I5): this is an unauthenticated,
@@ -135,6 +146,105 @@ func parseFlags(fs *flag.FlagSet, args []string) (flags config.Flags, printVersi
 		// function's doc comment above) — config.Load still resolves both
 		// from env var/config file.
 	}, *pv, nil
+}
+
+// ootleSupport bundles this gateway's Ootle L2 wiring (task brief "Ootle L2
+// stablecoin/native-resource payment support in taripay-gateway"). See
+// wireOotleSupport's doc comment for the "entirely optional" contract: an L1-only
+// merchant configures none of the underlying config fields and sees no behavior
+// change whatsoever.
+type ootleSupport struct {
+	// configured reports whether every required Ootle config field was set — if
+	// false, pollInvoice/sweep below are safe no-op-with-clear-error funcs (never
+	// nil), and instantiateInvoice likewise, so nothing downstream needs its own
+	// nil check.
+	configured bool
+	// instantiateInvoice is wired for invoice.Store.CreateOotle's
+	// InstantiateOotleInvoiceFunc parameter (task brief section 2) — no HTTP route
+	// calls CreateOotle in this dispatch (out of the task brief's explicit Scope
+	// section, which lists exactly six numbered items, none of them a new HTTP
+	// endpoint), so nothing calls this yet, but the DI seam is wired end-to-end
+	// here exactly as the task brief's section 2 asks for, ready for whichever
+	// future dispatch adds that endpoint (and/or once
+	// ootlepay.ErrAddressAllocationUnsupported's upstream gap is resolved).
+	instantiateInvoice invoice.InstantiateOotleInvoiceFunc
+	// pollInvoice is wired into internal/eventwatcher's PollOotleInvoices via
+	// runOotlePollLoop below.
+	pollInvoice eventwatcher.PollOotleInvoiceFunc
+	// sweep is wired into internal/admin's sweep route.
+	sweep admin.SweepFunc
+}
+
+// wireOotleSupport builds this gateway's Ootle L2 wiring from cfg. Ootle support is
+// entirely optional (like webhook delivery — see config.Config's own doc comment on
+// its Ootle fields): it is only actually "configured" once every one of
+// OotleOperatorSecret/OotleOperatorPublicKey/OotleOperatorFeeAccount/
+// OotleMerchantAccount/OotleRecoveryAccount is set. If any is missing, this returns
+// safe funcs that always report a clear "not configured" error rather than nil funcs
+// a caller would have to guard against separately.
+//
+// Real, verified ootle-go@v0.2.0 API used here — see internal/ootlepay's own package
+// doc comment for this dispatch's full API-verification trail:
+// ootle.Connect(baseURL string, opts ...ootle.ClientOption) *ootle.Client
+// (ootle-go@v0.2.0/ootle/driver.go:105) and
+// transport.NewClient(baseURL string, opts ...transport.Option) *transport.Client
+// (ootle-go@v0.2.0/transport/transport.go:168).
+func wireOotleSupport(cfg *config.Config) ootleSupport {
+	if cfg.OotleOperatorSecret == "" || cfg.OotleOperatorPublicKey == "" ||
+		cfg.OotleOperatorFeeAccount == "" || cfg.OotleMerchantAccount == "" ||
+		cfg.OotleRecoveryAccount == "" {
+		notConfigured := errors.New("gateway: ootle support not configured (set TARIPAY_OOTLE_OPERATOR_SECRET, TARIPAY_OOTLE_OPERATOR_PUBLIC_KEY, TARIPAY_OOTLE_OPERATOR_FEE_ACCOUNT, TARIPAY_OOTLE_MERCHANT_ACCOUNT, and TARIPAY_OOTLE_RECOVERY_ACCOUNT)")
+		return ootleSupport{
+			configured: false,
+			instantiateInvoice: func(ctx context.Context, paymentID, resourceAddress string, expectedAmount uint64) (string, error) {
+				return "", notConfigured
+			},
+			pollInvoice: func(ctx context.Context, componentAddress string) (bool, []string, error) {
+				return false, nil, notConfigured
+			},
+			sweep: func(ctx context.Context, componentAddress, recoveryAccount string) error {
+				return notConfigured
+			},
+		}
+	}
+
+	ootleClient := ootle.Connect(cfg.OotleIndexerURL, ootle.WithNetwork(ootle.Network(cfg.OotleNetwork)))
+	ootleTransport := transport.NewClient(cfg.OotleIndexerURL)
+	payClient := ootlepay.NewClient(ootleClient.SendInstructions, ootleTransport.FetchSubstate, ootle.DecodeSubstate, cfg.OotleOperatorFeeAccount, cfg.OotleOperatorSecret, 0)
+
+	return ootleSupport{
+		configured: true,
+		instantiateInvoice: func(ctx context.Context, paymentID, resourceAddress string, expectedAmount uint64) (string, error) {
+			return payClient.InstantiateInvoice(ctx, paymentID, cfg.OotleMerchantAccount, resourceAddress, expectedAmount, cfg.OotleOperatorPublicKey)
+		},
+		pollInvoice: payClient.PollInvoice,
+		sweep:       payClient.Sweep,
+	}
+}
+
+// runOotlePollLoop is the periodic polling loop for Ootle L2 invoices (task brief
+// section 4): every interval, it calls watcher.PollOotleInvoices once, logs the
+// outcome, and repeats, until ctx is cancelled. Same shape as
+// runWebhookRetryLoop/runTTLSweepLoop above (ticker, select on ctx.Done()/ticker.C).
+func runOotlePollLoop(ctx context.Context, watcher *eventwatcher.Watcher, pollInvoice eventwatcher.PollOotleInvoiceFunc, interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			count, err := watcher.PollOotleInvoices(ctx, pollInvoice)
+			if err != nil {
+				log.Printf("gateway: ootle poll loop: %v", err)
+				continue
+			}
+			if count > 0 {
+				log.Printf("gateway: ootle poll loop: examined %d non-terminal ootle invoice(s)", count)
+			}
+		}
+	}
 }
 
 func main() {
@@ -236,7 +346,24 @@ func main() {
 	// UI's manual retry button.
 	go runWebhookRetryLoop(ctx, webhookStore, sender, webhookRetryTickerInterval)
 
-	adminServer, err := admin.New(invoiceStore, webhookStore, sender, walletGRPC.Identify, walletGRPC.GetBalances, cfg.WebhookCallbackURL)
+	// Ootle L2 support (task brief "Ootle L2 stablecoin/native-resource payment
+	// support in taripay-gateway") — see wireOotleSupport's doc comment for the
+	// "entirely optional" contract this mirrors from WebhookCallbackURL/
+	// AdminAuthToken. Unlike those two, an unconfigured Ootle support is not loud
+	// enough to warrant its own explicit startup gate on any existing route (there
+	// is no Ootle-specific HTTP route in this dispatch — see ootleSupport's own
+	// doc comment on instantiateInvoice) — it only affects the poll loop
+	// (started only when configured, below) and the admin sweep route (which,
+	// unconfigured, cleanly errors on the rare invoice that's both chain='ootle'
+	// AND trapdoor-flagged, rather than ever being silently wrong).
+	ootleWiring := wireOotleSupport(cfg)
+	if !ootleWiring.configured {
+		log.Printf("gateway: WARNING: ootle L2 support not configured (TARIPAY_OOTLE_OPERATOR_SECRET / TARIPAY_OOTLE_OPERATOR_PUBLIC_KEY / TARIPAY_OOTLE_OPERATOR_FEE_ACCOUNT / TARIPAY_OOTLE_MERCHANT_ACCOUNT / TARIPAY_OOTLE_RECOVERY_ACCOUNT) — ootle invoice polling and the admin sweep action are disabled; L1 invoices are completely unaffected")
+	} else {
+		go runOotlePollLoop(ctx, watcher, ootleWiring.pollInvoice, ootlePollTickerInterval)
+	}
+
+	adminServer, err := admin.New(invoiceStore, webhookStore, sender, walletGRPC.Identify, walletGRPC.GetBalances, cfg.WebhookCallbackURL, ootleWiring.sweep, cfg.OotleRecoveryAccount)
 	if err != nil {
 		log.Fatalf("gateway: admin: %v", err)
 	}

@@ -44,6 +44,22 @@ const DefaultConfirmationDepth = 3
 // is set.
 const DefaultInvoiceTTLMinutes = 30
 
+// DefaultOotleIndexerURL matches github.com/tari-project/ootle-go@v0.2.0's own
+// transport.DefaultBaseURL — the Tari Ootle indexer's documented default REST API
+// address (applications/tari_indexer/src/config.rs: api_listen_address =
+// 127.0.0.1:18300, confirmed directly against that vendored dependency's
+// transport/transport.go), i.e. "point at an indexer started with no config
+// overrides on this machine", not an arbitrary made-up port — same precedent as
+// DefaultWalletGRPCAddress above. See internal/ootlepay's package doc comment for
+// the full ootle-go API research this dispatch performed.
+const DefaultOotleIndexerURL = "http://127.0.0.1:18300"
+
+// DefaultOotleNetwork matches ootle-go's own default network keyword
+// (ootle.NetworkLocalNet) — i.e. "point at a local devnet" until a specific network
+// is configured. Override via TARIPAY_OOTLE_NETWORK (e.g. "esmeralda") once pointed
+// at a real network.
+const DefaultOotleNetwork = "localnet"
+
 // Env var names, following this org's <PROJECT>_<FIELD> convention (see
 // go-tari-ootle-explorer's TARI_OOTLE_EXPLORER_* / this repo's TARIPAY_* prefix).
 const (
@@ -56,6 +72,17 @@ const (
 	envWebhookCallbackURL = "TARIPAY_WEBHOOK_CALLBACK_URL"
 	envWebhookHMACSecret  = "TARIPAY_WEBHOOK_HMAC_SECRET"
 	envAdminAuthToken     = "TARIPAY_ADMIN_AUTH_TOKEN"
+
+	// Ootle L2 support env vars (task brief "Ootle L2 stablecoin/native-resource
+	// payment support in taripay-gateway") — see Config's own doc comment on these
+	// fields for why every one of them is optional (no hard Load()-time error).
+	envOotleIndexerURL         = "TARIPAY_OOTLE_INDEXER_URL"
+	envOotleNetwork            = "TARIPAY_OOTLE_NETWORK"
+	envOotleMerchantAccount    = "TARIPAY_OOTLE_MERCHANT_ACCOUNT"
+	envOotleOperatorFeeAccount = "TARIPAY_OOTLE_OPERATOR_FEE_ACCOUNT"
+	envOotleOperatorSecret     = "TARIPAY_OOTLE_OPERATOR_SECRET"
+	envOotleOperatorPublicKey  = "TARIPAY_OOTLE_OPERATOR_PUBLIC_KEY"
+	envOotleRecoveryAccount    = "TARIPAY_OOTLE_RECOVERY_ACCOUNT"
 )
 
 // Config is the fully-resolved, ready-to-use configuration.
@@ -83,6 +110,29 @@ type Config struct {
 	WebhookCallbackURL string
 	WebhookHMACSecret  string
 	AdminAuthToken     string
+
+	// Ootle L2 support fields (task brief "Ootle L2 stablecoin/native-resource
+	// payment support in taripay-gateway"). All optional — same "no default, not a
+	// hard Load()-time error" treatment as WebhookCallbackURL/AdminAuthToken above:
+	// Ootle support is an entirely optional, additive feature (see
+	// internal/ootlepay's package doc comment and internal/db/migrations/
+	// 0005_ootle_invoices), so an L1-only merchant configures none of this and sees
+	// no behavior change whatsoever. cmd/gateway/main.go is responsible for
+	// deciding what "not fully configured" means for wiring purposes (mirroring
+	// how it already decides that for WebhookCallbackURL/AdminAuthToken); this
+	// package only resolves the values.
+	//
+	// OotleIndexerURL/OotleNetwork have real, cited defaults (see
+	// DefaultOotleIndexerURL/DefaultOotleNetwork above); the rest have none — they
+	// are this specific merchant's own on-chain addresses/keys, which no default
+	// could possibly guess correctly.
+	OotleIndexerURL         string
+	OotleNetwork            string
+	OotleMerchantAccount    string // component_<hex>; where a successful Ootle payment is forwarded
+	OotleOperatorFeeAccount string // component_<hex>; pays the µTari fee for operator-signed txs (sweep)
+	OotleOperatorSecret     string // hex secret key signing operator-initiated txs — a genuine secret, same treatment as WebhookHMACSecret/PostgresDSN (see Flags' doc comment: no CLI flag)
+	OotleOperatorPublicKey  string // hex public key committed into each invoice's on-chain `operator` field
+	OotleRecoveryAccount    string // component_<hex>; where internal/admin's sweep action forwards trapdoor-held funds
 }
 
 // Flags holds every CLI-flag-shaped override this package accepts. Callers (cmd/*
@@ -118,6 +168,20 @@ type Flags struct {
 	WebhookCallbackURL string
 	WebhookHMACSecret  string
 	AdminAuthToken     string
+
+	// Ootle L2 support fields, mirroring Config's own fields above.
+	// OotleOperatorSecret follows PostgresDSN/WebhookHMACSecret's exact precedent
+	// (see this struct's existing doc comment on those two fields): this package
+	// still resolves it at flag > env > file > default precedence like every other
+	// field, but cmd/gateway/main.go deliberately does not register an actual CLI
+	// flag for it, for the same /proc/<pid>/cmdline exposure reason.
+	OotleIndexerURL         string
+	OotleNetwork            string
+	OotleMerchantAccount    string
+	OotleOperatorFeeAccount string
+	OotleOperatorSecret     string
+	OotleOperatorPublicKey  string
+	OotleRecoveryAccount    string
 }
 
 // fileConfig is the raw shape decoded from an optional TOML config file. A config file
@@ -133,6 +197,14 @@ type fileConfig struct {
 	WebhookCallbackURL string `toml:"webhook_callback_url"`
 	WebhookHMACSecret  string `toml:"webhook_hmac_secret"`
 	AdminAuthToken     string `toml:"admin_auth_token"`
+
+	OotleIndexerURL         string `toml:"ootle_indexer_url"`
+	OotleNetwork            string `toml:"ootle_network"`
+	OotleMerchantAccount    string `toml:"ootle_merchant_account"`
+	OotleOperatorFeeAccount string `toml:"ootle_operator_fee_account"`
+	OotleOperatorSecret     string `toml:"ootle_operator_secret"`
+	OotleOperatorPublicKey  string `toml:"ootle_operator_public_key"`
+	OotleRecoveryAccount    string `toml:"ootle_recovery_account"`
 }
 
 // Load resolves a Config from flags, env vars, an optional TOML config file, and this
@@ -191,6 +263,17 @@ func Load(flags Flags) (*Config, error) {
 	// "don't register the admin routes at all if unset" behavior.
 	adminAuthToken := firstNonEmpty(flags.AdminAuthToken, os.Getenv(envAdminAuthToken), file.AdminAuthToken)
 
+	// Ootle L2 support fields (task brief "Ootle L2 stablecoin/native-resource
+	// payment support in taripay-gateway") — see Config's own doc comment: every
+	// field here is optional, none is a hard Load()-time error.
+	ootleIndexerURL := firstNonEmpty(flags.OotleIndexerURL, os.Getenv(envOotleIndexerURL), file.OotleIndexerURL, DefaultOotleIndexerURL)
+	ootleNetwork := firstNonEmpty(flags.OotleNetwork, os.Getenv(envOotleNetwork), file.OotleNetwork, DefaultOotleNetwork)
+	ootleMerchantAccount := firstNonEmpty(flags.OotleMerchantAccount, os.Getenv(envOotleMerchantAccount), file.OotleMerchantAccount)
+	ootleOperatorFeeAccount := firstNonEmpty(flags.OotleOperatorFeeAccount, os.Getenv(envOotleOperatorFeeAccount), file.OotleOperatorFeeAccount)
+	ootleOperatorSecret := firstNonEmpty(flags.OotleOperatorSecret, os.Getenv(envOotleOperatorSecret), file.OotleOperatorSecret)
+	ootleOperatorPublicKey := firstNonEmpty(flags.OotleOperatorPublicKey, os.Getenv(envOotleOperatorPublicKey), file.OotleOperatorPublicKey)
+	ootleRecoveryAccount := firstNonEmpty(flags.OotleRecoveryAccount, os.Getenv(envOotleRecoveryAccount), file.OotleRecoveryAccount)
+
 	return &Config{
 		WalletGRPCAddress:  walletAddr,
 		PostgresDSN:        postgresDSN,
@@ -200,6 +283,14 @@ func Load(flags Flags) (*Config, error) {
 		WebhookCallbackURL: webhookCallbackURL,
 		WebhookHMACSecret:  webhookHMACSecret,
 		AdminAuthToken:     adminAuthToken,
+
+		OotleIndexerURL:         ootleIndexerURL,
+		OotleNetwork:            ootleNetwork,
+		OotleMerchantAccount:    ootleMerchantAccount,
+		OotleOperatorFeeAccount: ootleOperatorFeeAccount,
+		OotleOperatorSecret:     ootleOperatorSecret,
+		OotleOperatorPublicKey:  ootleOperatorPublicKey,
+		OotleRecoveryAccount:    ootleRecoveryAccount,
 	}, nil
 }
 

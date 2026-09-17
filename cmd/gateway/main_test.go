@@ -677,7 +677,9 @@ func setupAdminServer(t *testing.T) *admin.Server {
 		return &tari_generated.GetBalanceResponse{AvailableBalance: 0}, nil
 	}
 
-	adminServer, err := admin.New(invoiceStore, webhookStore, fakeSender, identify, getBalances, "https://merchant.example/webhook")
+	adminServer, err := admin.New(invoiceStore, webhookStore, fakeSender, identify, getBalances, "https://merchant.example/webhook",
+		func(ctx context.Context, componentAddress, recoveryAccount string) error { return nil },
+		"component_recovery")
 	if err != nil {
 		t.Fatalf("admin.New() error = %v", err)
 	}

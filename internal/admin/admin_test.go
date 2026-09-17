@@ -39,7 +39,30 @@ const testDeliveryCallbackURL = "https://merchant.example/webhook"
 // currentCallbackURL is threaded straight into New's callbackURL parameter (the I2
 // fix, task brief part 2: the retry route must send to the CURRENTLY configured
 // callback URL, not the one frozen on the delivery row at creation time).
+//
+// Every test in this file that doesn't specifically exercise the sweep route gets a
+// default sweep func that always fails loudly (never silently "succeeds") — see
+// defaultUnconfiguredSweep's own doc comment — and an empty recovery account;
+// TestHandleSweep_* below use setupServerWithSweep instead to inject a real fake.
 func setupServer(t *testing.T, sender webhook.SenderInterface, identify IdentifyFunc, getBalances GetBalancesFunc, currentCallbackURL string) (*Server, *invoice.Store, *webhook.Store) {
+	t.Helper()
+	srv, invoiceStore, webhookStore, _ := setupServerWithSweep(t, sender, identify, getBalances, currentCallbackURL, nil, "")
+	return srv, invoiceStore, webhookStore
+}
+
+// defaultUnconfiguredSweep is the sweep func setupServer wires in when the calling
+// test doesn't care about sweep behavior — it always returns a clear error rather
+// than silently succeeding, so a test that accidentally exercises the sweep route
+// without meaning to fails loudly instead of masking a bug.
+func defaultUnconfiguredSweep(ctx context.Context, componentAddress, recoveryAccount string) error {
+	return errors.New("admin_test: sweep func not configured for this test")
+}
+
+// setupServerWithSweep is setupServer's superset: it also lets the caller inject a
+// custom SweepFunc + recovery account (task brief section 6's sweep-specific tests
+// need this; every other test in this file uses the plain setupServer helper above,
+// which fills in a safe default). sweep == nil uses defaultUnconfiguredSweep.
+func setupServerWithSweep(t *testing.T, sender webhook.SenderInterface, identify IdentifyFunc, getBalances GetBalancesFunc, currentCallbackURL string, sweep SweepFunc, ootleRecoveryAccount string) (*Server, *invoice.Store, *webhook.Store, *pgxpool.Pool) {
 	t.Helper()
 	dsn := os.Getenv("TARIPAY_TEST_POSTGRES_DSN")
 	if dsn == "" {
@@ -78,12 +101,15 @@ func setupServer(t *testing.T, sender webhook.SenderInterface, identify Identify
 			return &tari_generated.GetBalanceResponse{AvailableBalance: 1234}, nil
 		}
 	}
+	if sweep == nil {
+		sweep = defaultUnconfiguredSweep
+	}
 
-	srv, err := New(invoiceStore, webhookStore, sender, identify, getBalances, currentCallbackURL)
+	srv, err := New(invoiceStore, webhookStore, sender, identify, getBalances, currentCallbackURL, sweep, ootleRecoveryAccount)
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
 	}
-	return srv, invoiceStore, webhookStore
+	return srv, invoiceStore, webhookStore, pool
 }
 
 // fakeSender never performs real HTTP requests — used throughout this test file per
@@ -520,6 +546,7 @@ func adminRouteTestCases() []struct {
 		{"dashboard", http.MethodGet, "/admin"},
 		{"invoices list", http.MethodGet, "/admin/invoices"},
 		{"webhook retry", http.MethodPost, "/admin/webhooks/00000000-0000-0000-0000-000000000000/retry"},
+		{"invoice sweep", http.MethodPost, "/admin/invoices/00000000-0000-0000-0000-000000000000/sweep"},
 	}
 }
 
@@ -607,6 +634,10 @@ func TestRequireAuth_CorrectTokenReachesHandler(t *testing.T) {
 		{"dashboard", http.MethodGet, "/admin", http.StatusOK},
 		{"invoices list", http.MethodGet, "/admin/invoices", http.StatusOK},
 		{"webhook retry", http.MethodPost, "/admin/webhooks/" + delivery.ID.String() + "/retry", http.StatusOK},
+		// Unknown invoice id: confirms this route reaches the real handler (404,
+		// not 401) with the correct token — the sweep-specific happy/failure
+		// paths are covered in TestHandleSweep_* below.
+		{"invoice sweep", http.MethodPost, "/admin/invoices/00000000-0000-0000-0000-000000000000/sweep", http.StatusNotFound},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			req := authedRequest(tc.method, tc.target, nil)
@@ -691,5 +722,213 @@ func TestRequireAuth_EmptyTokenAlwaysRejects(t *testing.T) {
 
 	if rec.Code != http.StatusUnauthorized {
 		t.Errorf("status = %d, want %d (empty configured token must always reject)", rec.Code, http.StatusUnauthorized)
+	}
+}
+
+// ---- sweep route tests (task brief "Ootle L2 stablecoin/native-resource payment
+// support in taripay-gateway", section 5/6) ----
+
+const testRecoveryAccount = "component_recovery0000000000000000000000000000000000000000000000000000"
+
+// createFlaggedOotleInvoice seeds an Ootle invoice with OotleTrapdoorFlagged already
+// set true, for the sweep tests below.
+func createFlaggedOotleInvoice(t *testing.T, invoiceStore *invoice.Store, orderRef, componentAddress string) *invoice.Invoice {
+	t.Helper()
+	ctx := context.Background()
+	instantiate := func(ctx context.Context, paymentID string, resourceAddress string, expectedAmount uint64) (string, error) {
+		return componentAddress, nil
+	}
+	inv, err := invoiceStore.CreateOotle(ctx, orderRef, "resource_00", 1000, time.Hour, instantiate)
+	if err != nil {
+		t.Fatalf("CreateOotle() error = %v", err)
+	}
+	if err := invoiceStore.FlagTrapdoor(ctx, inv.ID); err != nil {
+		t.Fatalf("FlagTrapdoor() error = %v", err)
+	}
+	got, err := invoiceStore.GetByID(ctx, inv.ID)
+	if err != nil {
+		t.Fatalf("GetByID() error = %v", err)
+	}
+	return got
+}
+
+// TestHandleSweep_SuccessCallsSweepThenClearsTrapdoor covers the happy path (task
+// brief section 6): a successful sweep must call the injected SweepFunc with the
+// invoice's component address and the configured recovery account, THEN clear the
+// trapdoor flag, and render a success flash message.
+func TestHandleSweep_SuccessCallsSweepThenClearsTrapdoor(t *testing.T) {
+	sender := &fakeSender{statusCode: 200}
+	var gotComponent, gotRecovery string
+	sweepCalls := 0
+	sweep := func(ctx context.Context, componentAddress, recoveryAccount string) error {
+		sweepCalls++
+		gotComponent = componentAddress
+		gotRecovery = recoveryAccount
+		return nil
+	}
+	srv, invoiceStore, _, _ := setupServerWithSweep(t, sender, nil, nil, testDeliveryCallbackURL, sweep, testRecoveryAccount)
+
+	inv := createFlaggedOotleInvoice(t, invoiceStore, "order-sweep-success", "component_sweep_success")
+
+	mux := http.NewServeMux()
+	srv.RegisterRoutes(mux, testAdminAuthToken)
+
+	req := authedRequest(http.MethodPost, "/admin/invoices/"+inv.ID.String()+"/sweep", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d, body: %s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	if sweepCalls != 1 {
+		t.Fatalf("sweep called %d times, want 1", sweepCalls)
+	}
+	if gotComponent != *inv.OotleComponentAddress {
+		t.Errorf("sweep called with componentAddress = %q, want %q", gotComponent, *inv.OotleComponentAddress)
+	}
+	if gotRecovery != testRecoveryAccount {
+		t.Errorf("sweep called with recoveryAccount = %q, want %q", gotRecovery, testRecoveryAccount)
+	}
+	if !strings.Contains(rec.Body.String(), "swept successfully") {
+		t.Errorf("response body missing success flash message:\n%s", rec.Body.String())
+	}
+
+	got, err := invoiceStore.GetByID(context.Background(), inv.ID)
+	if err != nil {
+		t.Fatalf("GetByID() error = %v", err)
+	}
+	if got.OotleTrapdoorFlagged {
+		t.Errorf("OotleTrapdoorFlagged after successful sweep = true, want false (ClearTrapdoor must run after a successful sweep)")
+	}
+}
+
+// TestHandleSweep_FailureLeavesTrapdoorFlagged confirms a failing SweepFunc call
+// does NOT clear the trapdoor flag — the flag must stay set (visible, retryable)
+// when the funds were never actually recovered.
+func TestHandleSweep_FailureLeavesTrapdoorFlagged(t *testing.T) {
+	sender := &fakeSender{statusCode: 200}
+	wantErr := errors.New("ootlepay: sweep component_sweep_fail: tx rejected: Only the operator may sweep this invoice")
+	sweep := func(ctx context.Context, componentAddress, recoveryAccount string) error {
+		return wantErr
+	}
+	srv, invoiceStore, _, _ := setupServerWithSweep(t, sender, nil, nil, testDeliveryCallbackURL, sweep, testRecoveryAccount)
+
+	inv := createFlaggedOotleInvoice(t, invoiceStore, "order-sweep-fail", "component_sweep_fail")
+
+	mux := http.NewServeMux()
+	srv.RegisterRoutes(mux, testAdminAuthToken)
+
+	req := authedRequest(http.MethodPost, "/admin/invoices/"+inv.ID.String()+"/sweep", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d, body: %s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "Sweep failed") {
+		t.Errorf("response body missing failure flash message:\n%s", rec.Body.String())
+	}
+
+	got, err := invoiceStore.GetByID(context.Background(), inv.ID)
+	if err != nil {
+		t.Fatalf("GetByID() error = %v", err)
+	}
+	if !got.OotleTrapdoorFlagged {
+		t.Errorf("OotleTrapdoorFlagged after failed sweep = false, want true (ClearTrapdoor must not run when the sweep itself failed)")
+	}
+}
+
+// TestHandleSweep_NotTrapdoorFlaggedReturns409 confirms an invoice with no
+// trapdoor-flagged funds is rejected with 409 Conflict, and never reaches the
+// SweepFunc at all (same "reject before any side effect" precedent as
+// TestHandleWebhookRetry_AlreadyDeliveredReturns409).
+func TestHandleSweep_NotTrapdoorFlaggedReturns409(t *testing.T) {
+	sender := &fakeSender{statusCode: 200}
+	sweepCalls := 0
+	sweep := func(ctx context.Context, componentAddress, recoveryAccount string) error {
+		sweepCalls++
+		return nil
+	}
+	srv, invoiceStore, _, _ := setupServerWithSweep(t, sender, nil, nil, testDeliveryCallbackURL, sweep, testRecoveryAccount)
+
+	ctx := context.Background()
+	instantiate := func(ctx context.Context, paymentID string, resourceAddress string, expectedAmount uint64) (string, error) {
+		return "component_not_flagged", nil
+	}
+	inv, err := invoiceStore.CreateOotle(ctx, "order-sweep-not-flagged", "resource_00", 1000, time.Hour, instantiate)
+	if err != nil {
+		t.Fatalf("CreateOotle() error = %v", err)
+	}
+
+	mux := http.NewServeMux()
+	srv.RegisterRoutes(mux, testAdminAuthToken)
+
+	req := authedRequest(http.MethodPost, "/admin/invoices/"+inv.ID.String()+"/sweep", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want %d, body: %s", rec.Code, http.StatusConflict, rec.Body.String())
+	}
+	if sweepCalls != 0 {
+		t.Errorf("sweep called %d times, want 0 (must not sweep an invoice with no trapdoor-flagged funds)", sweepCalls)
+	}
+}
+
+// TestHandleSweep_UnknownIDReturns404 mirrors
+// TestHandleWebhookRetry_UnknownIDReturns404's precedent for the sweep route.
+func TestHandleSweep_UnknownIDReturns404(t *testing.T) {
+	sender := &fakeSender{statusCode: 200}
+	srv, _, _ := setupServer(t, sender, nil, nil, testDeliveryCallbackURL)
+
+	mux := http.NewServeMux()
+	srv.RegisterRoutes(mux, testAdminAuthToken)
+
+	req := authedRequest(http.MethodPost, "/admin/invoices/00000000-0000-0000-0000-000000000000/sweep", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusNotFound)
+	}
+}
+
+// TestRequireAuth_SweepRouteSpecificallyRequiresAuth is the sweep route's own
+// dedicated auth-required test (task brief section 6's explicit requirement: "same
+// pattern as this package's existing auth tests for the webhook-retry route" — see
+// TestRequireAuth_RetryRouteSpecificallyRequiresAuth above). Verifies both that an
+// unauthenticated sweep attempt is rejected AND that it never reaches the SweepFunc
+// (i.e. the auth check happens before any side effect).
+func TestRequireAuth_SweepRouteSpecificallyRequiresAuth(t *testing.T) {
+	sender := &fakeSender{statusCode: 200}
+	sweepCalls := 0
+	sweep := func(ctx context.Context, componentAddress, recoveryAccount string) error {
+		sweepCalls++
+		return nil
+	}
+	srv, invoiceStore, _, _ := setupServerWithSweep(t, sender, nil, nil, testDeliveryCallbackURL, sweep, testRecoveryAccount)
+
+	inv := createFlaggedOotleInvoice(t, invoiceStore, "order-sweep-noauth", "component_sweep_noauth")
+
+	mux := http.NewServeMux()
+	srv.RegisterRoutes(mux, testAdminAuthToken)
+
+	req := httptest.NewRequest(http.MethodPost, "/admin/invoices/"+inv.ID.String()+"/sweep", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want %d (sweep route without auth must be rejected)", rec.Code, http.StatusUnauthorized)
+	}
+	if sweepCalls != 0 {
+		t.Errorf("sweep called %d times, want 0 (sweep must not reach the SweepFunc without valid auth)", sweepCalls)
+	}
+
+	got, err := invoiceStore.GetByID(context.Background(), inv.ID)
+	if err != nil {
+		t.Fatalf("GetByID() error = %v", err)
+	}
+	if !got.OotleTrapdoorFlagged {
+		t.Errorf("OotleTrapdoorFlagged = false, want unchanged true (unauthenticated request must have no effect)")
 	}
 }
