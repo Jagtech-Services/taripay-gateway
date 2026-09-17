@@ -26,6 +26,15 @@
 // one more: the GetActiveByOrderRef method, which Create now calls internally to
 // make invoice creation idempotent on order_ref for the lifetime of a non-terminal
 // invoice — see both methods' doc comments for the exact contract.
+//
+// The Ootle L2 support dispatch ("Ootle L2 stablecoin/native-resource payment support
+// in taripay-gateway") adds this package's next narrow, additive slice, per this same
+// doc comment's own precedent of keeping the surface deliberately small: the Chain/
+// OotleComponentAddress/OotleResourceAddress/OotleTrapdoorFlagged Invoice fields, the
+// Chain constants, CreateOotle (parallel to Create, but for a chain='ootle' invoice —
+// see its own doc comment), FlagTrapdoor/ClearTrapdoor (mirroring UpdateStatus's
+// shape), and ListNonTerminalOotle (mirroring ListNonTerminal's shape, scoped to
+// chain='ootle' rows only, for internal/eventwatcher's PollOotleInvoices).
 package invoice
 
 import (
@@ -64,7 +73,45 @@ type Invoice struct {
 	// single event's amount (or, before this fix, not checking the amount at
 	// all).
 	AmountReceivedUTari uint64
+
+	// Chain is either ChainL1 (the default, for every existing/pre-Ootle invoice —
+	// see that const's doc comment) or ChainOotle. Added by the Ootle L2 support
+	// dispatch.
+	Chain string
+	// OotleComponentAddress is the instantiated per-invoice Ootle Invoice-template
+	// component's on-chain address (component_<hex>), set by CreateOotle once the
+	// instantiation transaction commits. Always nil for a ChainL1 invoice; nil for
+	// a ChainOotle invoice only in the (should-not-normally-happen) case that
+	// CreateOotle's own insert somehow raced a schema change — CreateOotle itself
+	// never inserts a chain='ootle' row without one.
+	OotleComponentAddress *string
+	// OotleResourceAddress is the resource this invoice expects to be paid in
+	// (the Invoice template's own expected_resource — see migration
+	// 0005_ootle_invoices' doc comment). Always nil for a ChainL1 invoice.
+	OotleResourceAddress *string
+	// OotleTrapdoorFlagged is set true by internal/eventwatcher's
+	// PollOotleInvoices when it observes the Invoice component's
+	// held_resources() non-empty while is_paid() is still false (money landed
+	// on-chain but could not be auto-forwarded) — see FlagTrapdoor/ClearTrapdoor
+	// and migration 0005_ootle_invoices' doc comment. Always false for a ChainL1
+	// invoice.
+	OotleTrapdoorFlagged bool
 }
+
+// Chain values for the invoices.chain column. Added by the Ootle L2 support dispatch
+// ("Ootle L2 stablecoin/native-resource payment support in taripay-gateway").
+const (
+	// ChainL1 is the existing per-invoice wallet-address + StreamTransactionEvents
+	// flow (internal/eventwatcher.Watcher.Run/Reconcile) — the column's DEFAULT,
+	// so every pre-existing and every future L1-only invoice is completely
+	// unaffected by this dispatch (see migration 0005_ootle_invoices' doc
+	// comment).
+	ChainL1 = "l1"
+	// ChainOotle is a per-invoice instantiation of the Snipa22/tari-ootle-invoice
+	// template's Invoice component, created via CreateOotle and polled via
+	// internal/eventwatcher.Watcher.PollOotleInvoices.
+	ChainOotle = "ootle"
+)
 
 // Status values for the invoices.status column.
 const (
@@ -132,6 +179,32 @@ var TerminalStatuses = map[string]bool{
 // inject a fake so they never touch a real wallet gRPC connection or global
 // walletGRPC package state.
 type ResolveAddressFunc func(paymentID string) (string, error)
+
+// InstantiateOotleInvoiceFunc instantiates a new per-invoice Ootle Invoice-template
+// component (Snipa22/tari-ootle-invoice's `Invoice::new_with_address`) and returns its
+// resulting on-chain component address. paymentID/resourceAddress/expectedAmount vary
+// per invoice (see CreateOotle, which supplies them); the merchant account address and
+// operator public key the template's constructor also needs are constant for this
+// single-tenant gateway deployment (per AGENTS.md's deployment model) and are captured
+// by the closure the real implementation is built from in cmd/gateway/main.go —
+// mirroring ResolveAddressFunc's own precedent above (the wallet gRPC address is
+// likewise closure-captured via walletGRPC.InitWalletGRPC, not passed per call). The
+// real implementation lives in internal/ootlepay.Client.InstantiateInvoice — see that
+// method's doc comment for the exact ootle-go API this calls (and, currently, the one
+// confirmed SDK gap that blocks it from actually committing a transaction yet).
+//
+// CreateOotle is the only caller in this dispatch; tests inject a fake so they never
+// touch a real Ootle indexer.
+type InstantiateOotleInvoiceFunc func(ctx context.Context, paymentID string, resourceAddress string, expectedAmount uint64) (componentAddress string, err error)
+
+// invoiceColumns is the exact column list (and order) every SELECT against `invoices`
+// in this file uses, and the order scanInvoice's Scan call expects — a single shared
+// constant so the Ootle L2 support dispatch's four new columns (chain,
+// ootle_component_address, ootle_resource_address, ootle_trapdoor_flagged) only need
+// to be added in ONE place rather than risking drift across GetByID/GetByPaymentID/
+// GetActiveByOrderRef/List/ListNonTerminal/ListNonTerminalOotle (six call sites as of
+// this dispatch).
+const invoiceColumns = `id, payment_id, order_ref, amount_utari, address, status, created_at, expires_at, confirmed_at, amount_received_utari, chain, ootle_component_address, ootle_resource_address, ootle_trapdoor_flagged`
 
 // Store wraps a *pgxpool.Pool with this package's invoice persistence operations.
 type Store struct {
@@ -209,6 +282,7 @@ func (s *Store) Create(ctx context.Context, orderRef string, amountUTari uint64,
 		Status:      StatusPending,
 		CreatedAt:   now,
 		ExpiresAt:   now.Add(ttl),
+		Chain:       ChainL1,
 	}
 
 	_, err = s.db.Exec(ctx, `
@@ -222,11 +296,73 @@ func (s *Store) Create(ctx context.Context, orderRef string, amountUTari uint64,
 	return inv, nil
 }
 
+// CreateOotle is Create's L2 twin — parallel to Create above, but for a
+// chain='ootle' invoice (task brief "Ootle L2 stablecoin/native-resource payment
+// support in taripay-gateway", section 2). Idempotent on orderRef via the exact same
+// GetActiveByOrderRef check-then-insert Create uses (see Create's own doc comment for
+// the full "create or return existing" contract, which applies here unchanged); a
+// lost-response retry from whatever eventually calls CreateOotle returns the SAME
+// invoice rather than instantiating a second on-chain component for the same order.
+//
+// If no active invoice exists for orderRef, generates a UUID (id/payment_id, exactly
+// as Create does), calls the injected instantiate func to actually create the
+// on-chain Invoice component (instead of Create's resolveAddress — see
+// InstantiateOotleInvoiceFunc's doc comment for why the merchant account/operator
+// pubkey are NOT parameters here), and inserts a row with Chain=ChainOotle,
+// OotleComponentAddress/OotleResourceAddress set, and Address set to the SAME
+// component address (there is no separate L1 wallet address for an Ootle invoice; the
+// component address doubles as the one thing the admin UI's existing {{.Address}}
+// column has to show — see internal/admin/templates/invoices_list.html). If
+// instantiation fails, no row is inserted (same "no orphan invoices" guarantee
+// Create's own doc comment describes for a resolveAddress failure).
+func (s *Store) CreateOotle(ctx context.Context, orderRef string, resourceAddress string, expectedAmount uint64, ttl time.Duration, instantiate InstantiateOotleInvoiceFunc) (*Invoice, error) {
+	existing, err := s.GetActiveByOrderRef(ctx, orderRef)
+	if err == nil {
+		return existing, nil
+	}
+	if !errors.Is(err, ErrNotFound) {
+		return nil, fmt.Errorf("invoice: check active order_ref %s: %w", orderRef, err)
+	}
+
+	id := uuid.New()
+	paymentID := id.String()
+
+	componentAddress, err := instantiate(ctx, paymentID, resourceAddress, expectedAmount)
+	if err != nil {
+		return nil, fmt.Errorf("invoice: instantiate ootle invoice for payment_id %s: %w", paymentID, err)
+	}
+
+	now := time.Now().UTC()
+	inv := &Invoice{
+		ID:                    id,
+		PaymentID:             paymentID,
+		OrderRef:              orderRef,
+		AmountUTari:           expectedAmount,
+		Address:               componentAddress,
+		Status:                StatusPending,
+		CreatedAt:             now,
+		ExpiresAt:             now.Add(ttl),
+		Chain:                 ChainOotle,
+		OotleComponentAddress: &componentAddress,
+		OotleResourceAddress:  &resourceAddress,
+	}
+
+	_, err = s.db.Exec(ctx, `
+		INSERT INTO invoices (id, payment_id, order_ref, amount_utari, address, status, created_at, expires_at, chain, ootle_component_address, ootle_resource_address)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+	`, inv.ID, inv.PaymentID, inv.OrderRef, int64(inv.AmountUTari), inv.Address, inv.Status, inv.CreatedAt, inv.ExpiresAt, inv.Chain, inv.OotleComponentAddress, inv.OotleResourceAddress)
+	if err != nil {
+		return nil, fmt.Errorf("invoice: insert ootle invoice: %w", err)
+	}
+
+	return inv, nil
+}
+
 // GetByID looks up an invoice by its primary key. Returns ErrNotFound if no such
 // invoice exists.
 func (s *Store) GetByID(ctx context.Context, id uuid.UUID) (*Invoice, error) {
 	row := s.db.QueryRow(ctx, `
-		SELECT id, payment_id, order_ref, amount_utari, address, status, created_at, expires_at, confirmed_at, amount_received_utari
+		SELECT `+invoiceColumns+`
 		FROM invoices WHERE id = $1
 	`, id)
 	return scanInvoice(row)
@@ -236,7 +372,7 @@ func (s *Store) GetByID(ctx context.Context, id uuid.UUID) (*Invoice, error) {
 // no such invoice exists.
 func (s *Store) GetByPaymentID(ctx context.Context, paymentID string) (*Invoice, error) {
 	row := s.db.QueryRow(ctx, `
-		SELECT id, payment_id, order_ref, amount_utari, address, status, created_at, expires_at, confirmed_at, amount_received_utari
+		SELECT `+invoiceColumns+`
 		FROM invoices WHERE payment_id = $1
 	`, paymentID)
 	return scanInvoice(row)
@@ -265,7 +401,7 @@ func (s *Store) GetActiveByOrderRef(ctx context.Context, orderRef string) (*Invo
 	}
 
 	row := s.db.QueryRow(ctx, `
-		SELECT id, payment_id, order_ref, amount_utari, address, status, created_at, expires_at, confirmed_at, amount_received_utari
+		SELECT `+invoiceColumns+`
 		FROM invoices
 		WHERE order_ref = $1 AND status != ALL($2)
 		ORDER BY created_at DESC
@@ -363,7 +499,7 @@ func (s *Store) ExpireStale(ctx context.Context) (int64, error) {
 // doc comment about not growing its surface ahead of actual need.
 func (s *Store) List(ctx context.Context, status string, limit int) ([]*Invoice, error) {
 	query := `
-		SELECT id, payment_id, order_ref, amount_utari, address, status, created_at, expires_at, confirmed_at, amount_received_utari
+		SELECT ` + invoiceColumns + `
 		FROM invoices
 	`
 	var args []any
@@ -414,7 +550,7 @@ func (s *Store) ListNonTerminal(ctx context.Context) ([]*Invoice, error) {
 	}
 
 	rows, err := s.db.Query(ctx, `
-		SELECT id, payment_id, order_ref, amount_utari, address, status, created_at, expires_at, confirmed_at, amount_received_utari
+		SELECT `+invoiceColumns+`
 		FROM invoices
 		WHERE status != ALL($1)
 		ORDER BY created_at ASC
@@ -438,6 +574,75 @@ func (s *Store) ListNonTerminal(ctx context.Context) ([]*Invoice, error) {
 	return out, nil
 }
 
+// ListNonTerminalOotle is ListNonTerminal's Ootle-scoped twin, added by the Ootle L2
+// support dispatch (task brief section 4): every invoice whose current status is NOT
+// one of TerminalStatuses AND whose chain is ChainOotle. internal/eventwatcher's
+// PollOotleInvoices calls this to find exactly the Ootle invoices that could still
+// need a poll — additive, per the task brief's explicit instruction not to change
+// ListNonTerminal's existing (chain-agnostic) contract.
+func (s *Store) ListNonTerminalOotle(ctx context.Context) ([]*Invoice, error) {
+	terminal := make([]string, 0, len(TerminalStatuses))
+	for status := range TerminalStatuses {
+		terminal = append(terminal, status)
+	}
+
+	rows, err := s.db.Query(ctx, `
+		SELECT `+invoiceColumns+`
+		FROM invoices
+		WHERE chain = $1 AND status != ALL($2)
+		ORDER BY created_at ASC
+	`, ChainOotle, terminal)
+	if err != nil {
+		return nil, fmt.Errorf("invoice: list non-terminal ootle: %w", err)
+	}
+	defer rows.Close()
+
+	var out []*Invoice
+	for rows.Next() {
+		inv, err := scanInvoice(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, inv)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("invoice: list non-terminal ootle: rows: %w", err)
+	}
+	return out, nil
+}
+
+// FlagTrapdoor sets an invoice's ootle_trapdoor_flagged column true — called by
+// internal/eventwatcher's PollOotleInvoices when it observes the Invoice component's
+// held_resources() non-empty while is_paid() is still false (see migration
+// 0005_ootle_invoices' doc comment). Mirrors UpdateStatus's shape: returns
+// ErrNotFound if no such invoice exists. Idempotent (setting an already-true flag
+// true again is a harmless no-op).
+func (s *Store) FlagTrapdoor(ctx context.Context, id uuid.UUID) error {
+	tag, err := s.db.Exec(ctx, `UPDATE invoices SET ootle_trapdoor_flagged = true WHERE id = $1`, id)
+	if err != nil {
+		return fmt.Errorf("invoice: flag trapdoor: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// ClearTrapdoor sets an invoice's ootle_trapdoor_flagged column false — called by
+// internal/admin's sweep handler after a successful internal/ootlepay.Client.Sweep
+// call has forwarded the held funds to the operator's configured recovery account.
+// Mirrors UpdateStatus's shape: returns ErrNotFound if no such invoice exists.
+func (s *Store) ClearTrapdoor(ctx context.Context, id uuid.UUID) error {
+	tag, err := s.db.Exec(ctx, `UPDATE invoices SET ootle_trapdoor_flagged = false WHERE id = $1`, id)
+	if err != nil {
+		return fmt.Errorf("invoice: clear trapdoor: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
 // rowScanner is the subset of pgx.Row's interface scanInvoice needs — satisfied by
 // both pgxpool.Pool.QueryRow's return value, letting this helper serve both GetByID
 // and GetByPaymentID above without duplicating the scan logic.
@@ -448,7 +653,11 @@ type rowScanner interface {
 func scanInvoice(row rowScanner) (*Invoice, error) {
 	var inv Invoice
 	var amountUTari, amountReceivedUTari int64
-	err := row.Scan(&inv.ID, &inv.PaymentID, &inv.OrderRef, &amountUTari, &inv.Address, &inv.Status, &inv.CreatedAt, &inv.ExpiresAt, &inv.ConfirmedAt, &amountReceivedUTari)
+	err := row.Scan(
+		&inv.ID, &inv.PaymentID, &inv.OrderRef, &amountUTari, &inv.Address, &inv.Status,
+		&inv.CreatedAt, &inv.ExpiresAt, &inv.ConfirmedAt, &amountReceivedUTari,
+		&inv.Chain, &inv.OotleComponentAddress, &inv.OotleResourceAddress, &inv.OotleTrapdoorFlagged,
+	)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, ErrNotFound

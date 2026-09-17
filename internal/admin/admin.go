@@ -54,6 +54,14 @@ const (
 type IdentifyFunc func() (*tari_generated.GetIdentityResponse, error)
 type GetBalancesFunc func() (*tari_generated.GetBalanceResponse, error)
 
+// SweepFunc matches internal/ootlepay.Client.Sweep's exact signature (task brief
+// "Ootle L2 stablecoin/native-resource payment support in taripay-gateway", section
+// 5). This package defines its own copy rather than importing internal/ootlepay
+// directly, same "no compile-time dependency on the wallet/chain-specific package"
+// precedent IdentifyFunc/GetBalancesFunc above already set for walletGRPC. Tests
+// inject a fake so they never touch a real Ootle indexer.
+type SweepFunc func(ctx context.Context, componentAddress, recoveryAccount string) error
+
 // Server holds every dependency this package's HTTP handlers need.
 type Server struct {
 	invoiceStore *invoice.Store
@@ -72,6 +80,19 @@ type Server struct {
 	// silently re-deliver signed payment data to a stale destination.
 	callbackURL string
 
+	// sweep is internal/ootlepay.Client.Sweep's real implementation (task brief
+	// "Ootle L2..." section 5), or a func that always returns a clear
+	// "not configured" error when Ootle support isn't configured (see
+	// cmd/gateway/main.go's wiring) — never nil, so handleSweep never risks a nil
+	// dereference.
+	sweep SweepFunc
+	// ootleRecoveryAccount is the CURRENTLY configured recovery account
+	// (cfg.OotleRecoveryAccount) every sweep forwards trapdoor-held funds to —
+	// single-tenant gateway, single recovery destination, same "read live config,
+	// not anything frozen on a row" precedent callbackURL above already sets for
+	// the webhook-retry route.
+	ootleRecoveryAccount string
+
 	dashboardTmpl  *template.Template
 	invoicesTmpl   *template.Template
 	deliveriesTmpl *template.Template
@@ -84,7 +105,11 @@ type Server struct {
 // callbackURL is the currently-configured webhook callback URL (cfg.WebhookCallbackURL)
 // — see Server.callbackURL's doc comment for why the retry route needs it threaded in
 // here rather than reading it off the delivery row being retried.
-func New(invoiceStore *invoice.Store, webhookStore *webhook.Store, sender webhook.SenderInterface, identify IdentifyFunc, getBalances GetBalancesFunc, callbackURL string) (*Server, error) {
+//
+// sweep/ootleRecoveryAccount are the Ootle L2 support sweep action's dependencies
+// (task brief "Ootle L2..." section 5) — see Server.sweep/Server.ootleRecoveryAccount's
+// doc comments.
+func New(invoiceStore *invoice.Store, webhookStore *webhook.Store, sender webhook.SenderInterface, identify IdentifyFunc, getBalances GetBalancesFunc, callbackURL string, sweep SweepFunc, ootleRecoveryAccount string) (*Server, error) {
 	dashboardTmpl, err := template.New("layout.html").ParseFS(templateFS, "templates/layout.html", "templates/dashboard.html", "templates/deliveries_panel.html")
 	if err != nil {
 		return nil, fmt.Errorf("admin: parse dashboard templates: %w", err)
@@ -99,15 +124,17 @@ func New(invoiceStore *invoice.Store, webhookStore *webhook.Store, sender webhoo
 	}
 
 	return &Server{
-		invoiceStore:   invoiceStore,
-		webhookStore:   webhookStore,
-		sender:         sender,
-		identify:       identify,
-		getBalances:    getBalances,
-		callbackURL:    callbackURL,
-		dashboardTmpl:  dashboardTmpl,
-		invoicesTmpl:   invoicesTmpl,
-		deliveriesTmpl: deliveriesTmpl,
+		invoiceStore:         invoiceStore,
+		webhookStore:         webhookStore,
+		sender:               sender,
+		identify:             identify,
+		getBalances:          getBalances,
+		callbackURL:          callbackURL,
+		sweep:                sweep,
+		ootleRecoveryAccount: ootleRecoveryAccount,
+		dashboardTmpl:        dashboardTmpl,
+		invoicesTmpl:         invoicesTmpl,
+		deliveriesTmpl:       deliveriesTmpl,
 	}, nil
 }
 
@@ -132,6 +159,11 @@ func (s *Server) RegisterRoutes(mux *http.ServeMux, authToken string) {
 	mux.Handle("GET /admin", requireAuth(authToken, http.HandlerFunc(s.handleDashboard)))
 	mux.Handle("GET /admin/invoices", requireAuth(authToken, http.HandlerFunc(s.handleInvoices)))
 	mux.Handle("POST /admin/webhooks/{id}/retry", requireAuth(authToken, http.HandlerFunc(s.handleWebhookRetry)))
+	// POST /admin/invoices/{id}/sweep (task brief "Ootle L2..." section 5): manual
+	// recovery of an Ootle invoice's trapdoor-held funds. Wrapped in requireAuth same
+	// as every other admin route, no exceptions — see this doc comment's own point
+	// about the retry route above; the same applies here.
+	mux.Handle("POST /admin/invoices/{id}/sweep", requireAuth(authToken, http.HandlerFunc(s.handleSweep)))
 
 	// GET /admin/static/htmx.min.js is deliberately NOT wrapped in
 	// requireAuth (task brief part 5, I11/I15): it's a static asset (this
@@ -343,10 +375,13 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// invoicesData is the template context for GET /admin/invoices.
+// invoicesData is the template context for GET /admin/invoices, and (with Flash/
+// FlashIsError populated) for handleSweep's re-rendered "invoices" fragment below.
 type invoicesData struct {
 	Invoices     []invoiceView
 	StatusFilter string
+	Flash        string
+	FlashIsError bool
 }
 
 // handleInvoices serves GET /admin/invoices: the full invoice list, optionally
@@ -470,4 +505,101 @@ func (s *Server) retryAndDescribe(ctx context.Context, delivery *webhook.Deliver
 		errMsg = *updated.LastError
 	}
 	return fmt.Sprintf("Webhook delivery %s retry failed: %s", delivery.ID, errMsg), true
+}
+
+// handleSweep serves POST /admin/invoices/{id}/sweep (task brief "Ootle L2
+// stablecoin/native-resource payment support in taripay-gateway", section 5): the
+// manual recovery action for an Ootle invoice whose trapdoor is flagged
+// (OotleTrapdoorFlagged) — funds that landed on-chain but could not be
+// auto-forwarded to the merchant. Loads the invoice, rejects (409) if it isn't
+// actually trapdoor-flagged (mirroring handleWebhookRetry's own "reject before any
+// side effect" precedent for a not-in-a-retryable-state row), calls s.sweep then
+// invoice.Store.ClearTrapdoor IN THAT ORDER (only clear the flag once the on-chain
+// sweep has actually succeeded — see sweepAndDescribe's own doc comment), then
+// re-renders the invoices list (same HTMX-fragment-swap pattern
+// handleWebhookRetry/deliveries_panel.html use) with a flash message describing the
+// outcome.
+func (s *Server) handleSweep(w http.ResponseWriter, r *http.Request) {
+	idStr := r.PathValue("id")
+	id, err := uuid.Parse(idStr)
+	if err != nil {
+		http.Error(w, "invalid invoice id", http.StatusBadRequest)
+		return
+	}
+
+	inv, err := s.invoiceStore.GetByID(r.Context(), id)
+	if err != nil {
+		if errors.Is(err, invoice.ErrNotFound) {
+			http.Error(w, "invoice not found", http.StatusNotFound)
+			return
+		}
+		http.Error(w, "failed to load invoice", http.StatusInternalServerError)
+		log.Printf("admin: sweep: load invoice %s: %v", id, err)
+		return
+	}
+
+	// Reject before any side effect (same precedent as handleWebhookRetry's own
+	// delivered-row check): an invoice with no trapdoor-flagged funds has nothing
+	// for this route to do.
+	if !inv.OotleTrapdoorFlagged {
+		http.Error(w, fmt.Sprintf("invoice %s has no trapdoor-flagged funds to sweep", inv.ID), http.StatusConflict)
+		return
+	}
+	if inv.OotleComponentAddress == nil || *inv.OotleComponentAddress == "" {
+		// Should not normally happen (CreateOotle never inserts a chain='ootle' row
+		// without a component address — see that method's own doc comment), but
+		// defensive: never call s.sweep with an empty address.
+		http.Error(w, fmt.Sprintf("invoice %s is trapdoor-flagged but has no ootle component address recorded", inv.ID), http.StatusInternalServerError)
+		log.Printf("admin: sweep: invoice %s is trapdoor-flagged but has no ootle_component_address", inv.ID)
+		return
+	}
+
+	flash, flashIsError := s.sweepAndDescribe(r.Context(), inv)
+
+	invoices, err := s.invoiceStore.List(r.Context(), "", 0)
+	if err != nil {
+		http.Error(w, "failed to reload invoices", http.StatusInternalServerError)
+		log.Printf("admin: sweep: reload invoices: %v", err)
+		return
+	}
+
+	data := invoicesData{Invoices: toInvoiceViews(invoices), Flash: flash, FlashIsError: flashIsError}
+	// Full-page render (Execute, not ExecuteTemplate on the "invoices" fragment
+	// alone): unlike the webhook-retry route's HTMX partial-swap button, this
+	// route's own form is a PLAIN <form method="post"> (task brief section 5's
+	// explicit ask, no hx-post/hx-target) — a plain form submission is a normal
+	// full-page browser navigation, so the response must be the complete
+	// layout.html-wrapped page (with the flash message embedded in it via the
+	// "invoices" block's own {{if .Flash}} — see invoices_list.html), not a bare
+	// fragment with no <head>/styles.
+	if err := s.invoicesTmpl.Execute(w, data); err != nil {
+		log.Printf("admin: render invoices page (after sweep): %v", err)
+	}
+}
+
+// sweepAndDescribe performs one sweep attempt (s.sweep, then — ONLY on success —
+// invoice.Store.ClearTrapdoor) and returns a human-readable flash message describing
+// the outcome.
+//
+// The ordering is deliberate and load-bearing: if s.sweep fails (a transport error,
+// or an on-chain rejection — see internal/ootlepay.Client.Sweep's own doc comment for
+// the non-operator-rejection case this mirrors), ClearTrapdoor is never called, so
+// the invoice stays visibly trapdoor-flagged for a retry — clearing the flag on a
+// sweep that never actually moved the funds would hide a real problem from the admin
+// panel. If s.sweep succeeds but ClearTrapdoor itself then fails (a transient DB
+// blip), the flash message says so explicitly rather than claiming an unqualified
+// success: the funds ARE safely recovered on-chain at that point, but the flag needs
+// a manual re-check/retry to actually clear.
+func (s *Server) sweepAndDescribe(ctx context.Context, inv *invoice.Invoice) (flash string, flashIsError bool) {
+	if err := s.sweep(ctx, *inv.OotleComponentAddress, s.ootleRecoveryAccount); err != nil {
+		log.Printf("admin: sweep: invoice %s component %s: %v", inv.ID, *inv.OotleComponentAddress, err)
+		return fmt.Sprintf("Sweep failed for invoice %s: %v", inv.ID, err), true
+	}
+
+	if err := s.invoiceStore.ClearTrapdoor(ctx, inv.ID); err != nil {
+		log.Printf("admin: sweep: invoice %s: on-chain sweep succeeded but ClearTrapdoor failed: %v", inv.ID, err)
+		return fmt.Sprintf("Invoice %s was swept on-chain successfully, but clearing its trapdoor flag failed: %v (the flag remains set; retry or check manually).", inv.ID, err), true
+	}
+
+	return fmt.Sprintf("Invoice %s swept successfully to the configured recovery account.", inv.ID), false
 }

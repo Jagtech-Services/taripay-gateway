@@ -1066,3 +1066,231 @@ func TestMapStatus_RejectedStillMapsToRejected(t *testing.T) {
 		t.Errorf("mapStatus(%q) event = %q, want %q", "Rejected", gotEvent, "payment.rejected")
 	}
 }
+
+// ---- PollOotleInvoices tests (task brief "Ootle L2 stablecoin/native-resource
+// payment support in taripay-gateway", section 4/6) ----
+
+func createOotleInvoice(t *testing.T, invoiceStore *invoice.Store, orderRef, componentAddress string, amount uint64) *invoice.Invoice {
+	t.Helper()
+	instantiate := func(ctx context.Context, paymentID string, resourceAddress string, expectedAmount uint64) (string, error) {
+		return componentAddress, nil
+	}
+	inv, err := invoiceStore.CreateOotle(context.Background(), orderRef, "resource_00", amount, time.Hour, instantiate)
+	if err != nil {
+		t.Fatalf("CreateOotle(%s) error = %v", orderRef, err)
+	}
+	return inv
+}
+
+// TestPollOotleInvoices_ConfirmedFiresWebhookAndUpdatesStatus covers the "confirmed"
+// case (task brief section 6): a fake pollInvoice reporting paid=true must transition
+// the invoice to StatusConfirmed and fire a payment.confirmed webhook, via the SAME
+// fireWebhook path handleTransaction/Reconcile use.
+func TestPollOotleInvoices_ConfirmedFiresWebhookAndUpdatesStatus(t *testing.T) {
+	invoiceStore, webhookStore := setupStores(t)
+	ctx := context.Background()
+
+	inv := createOotleInvoice(t, invoiceStore, "order-ootle-confirmed", "component_confirmed", 1000)
+
+	pollInvoice := func(ctx context.Context, componentAddress string) (bool, []string, error) {
+		if componentAddress != *inv.OotleComponentAddress {
+			t.Errorf("pollInvoice called with componentAddress = %q, want %q", componentAddress, *inv.OotleComponentAddress)
+		}
+		return true, nil, nil
+	}
+
+	spy := &spySender{}
+	w := NewWatcher(invoiceStore, webhookStore, spy, "https://merchant.example/webhook", nil)
+
+	n, err := w.PollOotleInvoices(ctx, pollInvoice)
+	if err != nil {
+		t.Fatalf("PollOotleInvoices() error = %v", err)
+	}
+	if n != 1 {
+		t.Errorf("PollOotleInvoices() examined = %d, want 1", n)
+	}
+
+	got, err := invoiceStore.GetByID(ctx, inv.ID)
+	if err != nil {
+		t.Fatalf("GetByID() error = %v", err)
+	}
+	if got.Status != invoice.StatusConfirmed {
+		t.Errorf("Status = %q, want %q", got.Status, invoice.StatusConfirmed)
+	}
+	if got.ConfirmedAt == nil {
+		t.Error("ConfirmedAt is nil, want it set")
+	}
+	if got.OotleTrapdoorFlagged {
+		t.Error("OotleTrapdoorFlagged = true, want false (a confirmed payment is not a trapdoor)")
+	}
+
+	if got := spy.callCount(); got != 1 {
+		t.Errorf("spy.callCount() = %d, want 1", got)
+	}
+	deliveries, err := webhookStore.ListRecent(ctx, 10)
+	if err != nil {
+		t.Fatalf("ListRecent() error = %v", err)
+	}
+	if len(deliveries) != 1 {
+		t.Fatalf("len(deliveries) = %d, want 1", len(deliveries))
+	}
+	var payload webhook.Payload
+	if err := json.Unmarshal(deliveries[0].Payload, &payload); err != nil {
+		t.Fatalf("unmarshal delivery payload: %v", err)
+	}
+	if payload.Event != "payment.confirmed" {
+		t.Errorf("payload.Event = %q, want %q", payload.Event, "payment.confirmed")
+	}
+	if payload.AmountUTari != 1000 {
+		t.Errorf("payload.AmountUTari = %d, want 1000 (exact-match, no underpaid/overpaid concept for Ootle)", payload.AmountUTari)
+	}
+}
+
+// TestPollOotleInvoices_TrapdoorFlagsWithoutStatusChangeOrWebhook covers the
+// "trapdoor-flag" case (task brief section 6): paid=false with non-empty
+// heldResources must flag the trapdoor, WITHOUT changing status and WITHOUT firing a
+// webhook (per this dispatch's explicit "What NOT to do" section: no
+// payment.trapdoor webhook event).
+func TestPollOotleInvoices_TrapdoorFlagsWithoutStatusChangeOrWebhook(t *testing.T) {
+	invoiceStore, webhookStore := setupStores(t)
+	ctx := context.Background()
+
+	inv := createOotleInvoice(t, invoiceStore, "order-ootle-trapdoor", "component_trapdoor", 1000)
+
+	pollInvoice := func(ctx context.Context, componentAddress string) (bool, []string, error) {
+		return false, []string{"resource_wrong"}, nil
+	}
+
+	spy := &spySender{}
+	w := NewWatcher(invoiceStore, webhookStore, spy, "https://merchant.example/webhook", nil)
+
+	n, err := w.PollOotleInvoices(ctx, pollInvoice)
+	if err != nil {
+		t.Fatalf("PollOotleInvoices() error = %v", err)
+	}
+	if n != 1 {
+		t.Errorf("PollOotleInvoices() examined = %d, want 1", n)
+	}
+
+	got, err := invoiceStore.GetByID(ctx, inv.ID)
+	if err != nil {
+		t.Fatalf("GetByID() error = %v", err)
+	}
+	if got.Status != invoice.StatusPending {
+		t.Errorf("Status = %q, want unchanged %q (trapdoor is not a status transition)", got.Status, invoice.StatusPending)
+	}
+	if !got.OotleTrapdoorFlagged {
+		t.Error("OotleTrapdoorFlagged = false, want true")
+	}
+	if got.ConfirmedAt != nil {
+		t.Errorf("ConfirmedAt = %v, want nil", got.ConfirmedAt)
+	}
+
+	if got := spy.callCount(); got != 0 {
+		t.Errorf("spy.callCount() = %d, want 0 (no payment.trapdoor webhook per this dispatch's explicit scope)", got)
+	}
+}
+
+// TestPollOotleInvoices_NoChangeLeavesInvoiceUntouched covers the "no-change" case
+// (task brief section 6): paid=false with no held resources must leave the invoice
+// exactly as it was.
+func TestPollOotleInvoices_NoChangeLeavesInvoiceUntouched(t *testing.T) {
+	invoiceStore, webhookStore := setupStores(t)
+	ctx := context.Background()
+
+	inv := createOotleInvoice(t, invoiceStore, "order-ootle-nochange", "component_nochange", 1000)
+
+	pollInvoice := func(ctx context.Context, componentAddress string) (bool, []string, error) {
+		return false, nil, nil
+	}
+
+	spy := &spySender{}
+	w := NewWatcher(invoiceStore, webhookStore, spy, "https://merchant.example/webhook", nil)
+
+	n, err := w.PollOotleInvoices(ctx, pollInvoice)
+	if err != nil {
+		t.Fatalf("PollOotleInvoices() error = %v", err)
+	}
+	if n != 1 {
+		t.Errorf("PollOotleInvoices() examined = %d, want 1", n)
+	}
+
+	got, err := invoiceStore.GetByID(ctx, inv.ID)
+	if err != nil {
+		t.Fatalf("GetByID() error = %v", err)
+	}
+	if got.Status != invoice.StatusPending {
+		t.Errorf("Status = %q, want unchanged %q", got.Status, invoice.StatusPending)
+	}
+	if got.OotleTrapdoorFlagged {
+		t.Error("OotleTrapdoorFlagged = true, want false")
+	}
+	if got := spy.callCount(); got != 0 {
+		t.Errorf("spy.callCount() = %d, want 0", got)
+	}
+}
+
+// TestPollOotleInvoices_IgnoresL1Invoices confirms L1 (chain='l1') invoices are never
+// examined by PollOotleInvoices, even when non-terminal.
+func TestPollOotleInvoices_IgnoresL1Invoices(t *testing.T) {
+	invoiceStore, webhookStore := setupStores(t)
+	ctx := context.Background()
+
+	if _, err := invoiceStore.Create(ctx, "order-l1-ignored", 1000, time.Hour); err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+
+	pollCalls := 0
+	pollInvoice := func(ctx context.Context, componentAddress string) (bool, []string, error) {
+		pollCalls++
+		return false, nil, nil
+	}
+
+	spy := &spySender{}
+	w := NewWatcher(invoiceStore, webhookStore, spy, "https://merchant.example/webhook", nil)
+
+	n, err := w.PollOotleInvoices(ctx, pollInvoice)
+	if err != nil {
+		t.Fatalf("PollOotleInvoices() error = %v", err)
+	}
+	if n != 0 {
+		t.Errorf("PollOotleInvoices() examined = %d, want 0 (L1 invoices must be ignored)", n)
+	}
+	if pollCalls != 0 {
+		t.Errorf("pollInvoice called %d times, want 0", pollCalls)
+	}
+}
+
+// TestPollOotleInvoices_PollErrorSkipsInvoiceWithoutFailingPass confirms a
+// per-invoice pollInvoice failure is logged and skipped, not fatal to the rest of the
+// pass — same "log and keep going" precedent handleTransaction/Reconcile use for a
+// single bad read.
+func TestPollOotleInvoices_PollErrorSkipsInvoiceWithoutFailingPass(t *testing.T) {
+	invoiceStore, webhookStore := setupStores(t)
+	ctx := context.Background()
+
+	inv := createOotleInvoice(t, invoiceStore, "order-ootle-poll-error", "component_poll_error", 1000)
+
+	pollInvoice := func(ctx context.Context, componentAddress string) (bool, []string, error) {
+		return false, nil, errors.New("ootlepay: indexer unreachable")
+	}
+
+	spy := &spySender{}
+	w := NewWatcher(invoiceStore, webhookStore, spy, "https://merchant.example/webhook", nil)
+
+	n, err := w.PollOotleInvoices(ctx, pollInvoice)
+	if err != nil {
+		t.Fatalf("PollOotleInvoices() error = %v, want nil (a per-invoice poll error must not fail the whole pass)", err)
+	}
+	if n != 1 {
+		t.Errorf("PollOotleInvoices() examined = %d, want 1", n)
+	}
+
+	got, err := invoiceStore.GetByID(ctx, inv.ID)
+	if err != nil {
+		t.Fatalf("GetByID() error = %v", err)
+	}
+	if got.Status != invoice.StatusPending {
+		t.Errorf("Status = %q, want unchanged %q", got.Status, invoice.StatusPending)
+	}
+}

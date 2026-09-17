@@ -658,3 +658,102 @@ func transactionInfoStatusText(status tari_generated.TransactionStatus) string {
 		return status.String()
 	}
 }
+
+// PollOotleInvoiceFunc matches internal/ootlepay.Client.PollInvoice's exact signature
+// (task brief "Ootle L2 stablecoin/native-resource payment support in
+// taripay-gateway", section 3/4). Passed as a parameter to PollOotleInvoices below —
+// same "pass the external-call func in per call, not stored on Watcher" precedent
+// Reconcile's own GetCompletedByPaymentIDFunc parameter already sets for this package
+// — rather than added to NewWatcher's constructor, which would force every existing
+// 5-arg NewWatcher call site (including every test in this package) to change for a
+// feature most deployments (L1-only merchants) never use. Tests inject a fake so they
+// never touch a real Ootle indexer.
+type PollOotleInvoiceFunc func(ctx context.Context, componentAddress string) (paid bool, heldResources []string, err error)
+
+// PollOotleInvoices is the Ootle L2 polling loop's single pass (task brief section
+// 4): for every non-terminal chain='ootle' invoice (invoice.Store.ListNonTerminalOotle),
+// it calls pollInvoice against that invoice's OotleComponentAddress and applies the
+// task brief's exact status-transition rule:
+//
+//   - paid == true -> StatusConfirmed, reusing fireWebhook (the SAME atomic
+//     status-update + webhook-delivery path handleTransaction's live-stream/Reconcile
+//     callers already use — see fireWebhook's own doc comment), so an Ootle
+//     confirmation fires exactly the same "payment.confirmed" webhook shape an L1
+//     confirmation does. The Invoice template's `pay()` is an exact-amount match
+//     only (tari-ootle-invoice/src/lib.rs, "no tolerance range" per its own README),
+//     so the confirmed amount is always the invoice's own AmountUTari — there is no
+//     underpaid/overpaid concept on this chain in v1.
+//   - paid == false && len(heldResources) > 0 -> invoice.Store.FlagTrapdoor(inv.ID),
+//     NOT a status change (per the task brief's explicit instruction: money stuck is
+//     a distinct, admin-panel-visible signal, not a new invoice.Status value) and NOT
+//     a webhook (per this dispatch's "What NOT to do" section: no payment.trapdoor
+//     webhook event is added without a project-owner decision).
+//   - paid == false && len(heldResources) == 0 -> no change (still waiting for a
+//     payment).
+//
+// Mirrors Reconcile's own (examined int, err error) shape/semantics: examined counts
+// every non-terminal Ootle invoice looked at regardless of outcome; a per-invoice
+// pollInvoice failure is logged and that invoice skipped (not fatal to the rest of
+// the pass), matching handleTransaction/Reconcile's own "log and keep going"
+// precedent for a single bad read. A non-nil error is only returned for an
+// infra-level failure listing non-terminal Ootle invoices in the first place
+// (ListNonTerminalOotle).
+//
+// NOTE (this dispatch's confirmed open question, cited in internal/ootlepay's own
+// package doc comment): pollInvoice's real implementation (ootlepay.Client.PollInvoice)
+// currently always reports paid=false — a confirmed github.com/tari-project/ootle-go
+// v0.2.0 API gap, not a bug in this method — so in practice, until that upstream gap
+// is resolved, this loop will only ever flag trapdoors, never auto-confirm an Ootle
+// invoice. This method's own logic is written against the FULL documented contract
+// above regardless, so it needs no changes once that gap is closed upstream — see
+// this package's own tests, which exercise the paid==true path directly via a fake
+// pollInvoice.
+func (w *Watcher) PollOotleInvoices(ctx context.Context, pollInvoice PollOotleInvoiceFunc) (int, error) {
+	invoices, err := w.invoiceStore.ListNonTerminalOotle(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("eventwatcher: poll ootle invoices: list non-terminal ootle invoices: %w", err)
+	}
+
+	examined := 0
+	for _, inv := range invoices {
+		if ctx.Err() != nil {
+			return examined, ctx.Err()
+		}
+		examined++
+
+		if inv.OotleComponentAddress == nil || *inv.OotleComponentAddress == "" {
+			log.Printf("eventwatcher: poll ootle invoices: invoice %s has chain=ootle but no ootle_component_address, skipping", inv.ID)
+			continue
+		}
+		componentAddress := *inv.OotleComponentAddress
+
+		paid, heldResources, err := pollInvoice(ctx, componentAddress)
+		if err != nil {
+			log.Printf("eventwatcher: poll ootle invoices: poll component %s (invoice %s): %v (skipping)", componentAddress, inv.ID, err)
+			continue
+		}
+
+		switch {
+		case paid:
+			if isTerminalStatus(inv.Status) {
+				// Defensive terminal-state guard, same principle as
+				// handleTransaction's own (S2/AI-05 fix) terminal-state guard —
+				// should not normally happen since ListNonTerminalOotle already
+				// excludes terminal invoices, but a concurrent transition
+				// between that list query and this pollInvoice call is not
+				// impossible.
+				log.Printf("eventwatcher: poll ootle invoices: invoice %s already in terminal status %q, ignoring post-terminal paid signal", inv.ID, inv.Status)
+				continue
+			}
+			now := time.Now().UTC()
+			w.fireWebhook(ctx, inv, invoice.StatusConfirmed, "payment.confirmed", componentAddress, &now, inv.AmountUTari)
+		case len(heldResources) > 0:
+			if err := w.invoiceStore.FlagTrapdoor(ctx, inv.ID); err != nil {
+				log.Printf("eventwatcher: poll ootle invoices: flag trapdoor for invoice %s: %v", inv.ID, err)
+			}
+		default:
+			// No change: still waiting for a payment, nothing held.
+		}
+	}
+	return examined, nil
+}

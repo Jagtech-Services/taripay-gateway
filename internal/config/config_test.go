@@ -194,6 +194,76 @@ func TestLoad_WebhookFieldsFlagOverridesEnv(t *testing.T) {
 	}
 }
 
+// ---- Ootle L2 support field tests (task brief "Ootle L2 stablecoin/native-resource
+// payment support in taripay-gateway") ----
+
+// TestLoad_OotleFieldsDefaultsAndEmpty covers the two Ootle fields with real defaults
+// (OotleIndexerURL/OotleNetwork) applying when unset, and the rest (this specific
+// merchant's own on-chain addresses/keys — no sane default exists) resolving to ""
+// WITHOUT Load() erroring, mirroring WebhookCallbackURL/WebhookHMACSecret's own
+// precedent.
+func TestLoad_OotleFieldsDefaultsAndEmpty(t *testing.T) {
+	cfg, err := Load(Flags{PostgresDSN: "postgres://example/db"})
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.OotleIndexerURL != DefaultOotleIndexerURL {
+		t.Errorf("OotleIndexerURL = %q, want default %q", cfg.OotleIndexerURL, DefaultOotleIndexerURL)
+	}
+	if cfg.OotleNetwork != DefaultOotleNetwork {
+		t.Errorf("OotleNetwork = %q, want default %q", cfg.OotleNetwork, DefaultOotleNetwork)
+	}
+	for name, got := range map[string]string{
+		"OotleMerchantAccount":    cfg.OotleMerchantAccount,
+		"OotleOperatorFeeAccount": cfg.OotleOperatorFeeAccount,
+		"OotleOperatorSecret":     cfg.OotleOperatorSecret,
+		"OotleOperatorPublicKey":  cfg.OotleOperatorPublicKey,
+		"OotleRecoveryAccount":    cfg.OotleRecoveryAccount,
+	} {
+		if got != "" {
+			t.Errorf("%s = %q, want empty (no default, not configured)", name, got)
+		}
+	}
+}
+
+// TestLoad_OotleFieldsFromEnv covers every Ootle env var overriding its default/empty
+// value.
+func TestLoad_OotleFieldsFromEnv(t *testing.T) {
+	t.Setenv(envOotleIndexerURL, "http://10.0.0.9:18300")
+	t.Setenv(envOotleNetwork, "esmeralda")
+	t.Setenv(envOotleMerchantAccount, "component_merchant")
+	t.Setenv(envOotleOperatorFeeAccount, "component_fee")
+	t.Setenv(envOotleOperatorSecret, "operator-secret-value")
+	t.Setenv(envOotleOperatorPublicKey, "aabbcc")
+	t.Setenv(envOotleRecoveryAccount, "component_recovery")
+
+	cfg, err := Load(Flags{PostgresDSN: "postgres://example/db"})
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.OotleIndexerURL != "http://10.0.0.9:18300" {
+		t.Errorf("OotleIndexerURL = %q, want env value", cfg.OotleIndexerURL)
+	}
+	if cfg.OotleNetwork != "esmeralda" {
+		t.Errorf("OotleNetwork = %q, want env value", cfg.OotleNetwork)
+	}
+	if cfg.OotleMerchantAccount != "component_merchant" {
+		t.Errorf("OotleMerchantAccount = %q, want env value", cfg.OotleMerchantAccount)
+	}
+	if cfg.OotleOperatorFeeAccount != "component_fee" {
+		t.Errorf("OotleOperatorFeeAccount = %q, want env value", cfg.OotleOperatorFeeAccount)
+	}
+	if cfg.OotleOperatorSecret != "operator-secret-value" {
+		t.Errorf("OotleOperatorSecret = %q, want env value", cfg.OotleOperatorSecret)
+	}
+	if cfg.OotleOperatorPublicKey != "aabbcc" {
+		t.Errorf("OotleOperatorPublicKey = %q, want env value", cfg.OotleOperatorPublicKey)
+	}
+	if cfg.OotleRecoveryAccount != "component_recovery" {
+		t.Errorf("OotleRecoveryAccount = %q, want env value", cfg.OotleRecoveryAccount)
+	}
+}
+
 // writeTempConfig writes contents to a temp TOML file and returns its path.
 func writeTempConfig(t *testing.T, contents string) string {
 	t.Helper()

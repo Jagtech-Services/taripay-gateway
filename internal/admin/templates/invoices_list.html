@@ -1,4 +1,9 @@
 {{define "content"}}
+{{template "invoices" .}}
+{{end}}
+
+{{define "invoices"}}
+<div id="invoices-panel">
 <h2>Invoices</h2>
 <div class="status-filters">
     Filter:
@@ -11,12 +16,16 @@
     <a href="/admin/invoices?status=rejected">rejected</a>
 </div>
 
+{{if .Flash}}
+<div class="flash-message {{if .FlashIsError}}error{{else}}success{{end}}">{{.Flash}}</div>
+{{end}}
+
 {{if not .Invoices}}
 <p class="empty-note">No invoices{{if .StatusFilter}} with status "{{.StatusFilter}}"{{end}}.</p>
 {{else}}
 <table>
     <thead>
-    <tr><th>Created</th><th>Order Ref</th><th>Amount (uT)</th><th>Status</th><th>Payment ID</th><th>Address</th><th>Expires</th><th>Confirmed</th></tr>
+    <tr><th>Created</th><th>Order Ref</th><th>Amount (uT)</th><th>Status</th><th>Payment ID</th><th>Chain</th><th>Address</th><th>Expires</th><th>Confirmed</th><th>Trapdoor</th></tr>
     </thead>
     <tbody>
     {{range .Invoices}}
@@ -26,12 +35,24 @@
         <td>{{.AmountUTari}}</td>
         <td>{{.Status}}</td>
         <td>{{.PaymentID}}</td>
+        <td>{{.Chain}}</td>
         <td>{{.Address}}</td>
         <td>{{.ExpiresAtDisplay}}</td>
         <td>{{.ConfirmedAtDisplay}}</td>
+        <td>
+            {{if .OotleTrapdoorFlagged}}
+            <form method="post" action="/admin/invoices/{{.ID}}/sweep"
+                  onsubmit="return confirm('Sweep invoice {{.ID}}\'s trapdoor-held funds to the configured recovery account?')"
+                  style="display:inline">
+                <button type="submit">Sweep</button>
+            </form>
+            {{end}}
+        </td>
     </tr>
     {{end}}
     </tbody>
 </table>
 {{end}}
+</div>
 {{end}}
+
