@@ -1,10 +1,10 @@
-module github.com/Snipa22/taripay-gateway
+module github.com/Jagtech-Services/taripay-gateway
 
 go 1.25.14
 
 require (
-	github.com/Snipa22/go-tari-grpc-lib/v3 v3.2.0
-	github.com/Snipa22/go-tari-lib v1.3.1-0.20260913183547-def118969dbc
+	github.com/Jagtech-Services/go-tari-grpc-lib/v3 v3.5.0
+	github.com/Jagtech-Services/go-tari-lib/v3 v3.1.0
 	github.com/google/uuid v1.6.0
 	github.com/jackc/pgx/v5 v5.11.0
 	github.com/pelletier/go-toml/v2 v2.4.3

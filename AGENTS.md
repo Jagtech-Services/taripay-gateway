@@ -5,8 +5,8 @@ Instructions for AI coding agents (OpenCode, Claude Code, or any `agents.md`-com
 ## Project
 
 - **What this repo is:** TariPay Gateway — a self-hosted Tari (XTM) payment gateway service. Merchants run their own instance against their own `minotari_console_wallet` (daemon-mode, gRPC). It issues per-order invoices tagged with a payment ID, hands out a wallet address, watches the wallet's event stream for payment, and fires signed webhooks back to the store (e.g. a WooCommerce plugin, built separately). Modeled on BTCPay Server's architecture: thin cart-side plugin, all wallet logic lives here, no third-party custody.
-- **Module path:** `github.com/Snipa22/taripay-gateway`
-- **Depends on:** `github.com/Snipa22/go-tari-lib` (wallet gRPC wrapper — use its `walletGRPC` package's `InitWalletGRPC`, `GetPaymentIdAddress`, `StreamTransactionEvents`, `GetCompletedTransactionsByPaymentID`, `Identify`, `GetBalances` functions; do not reimplement wallet gRPC calls here), `github.com/Snipa22/go-tari-grpc-lib/v3` (transitive, for `tari_generated` types).
+- **Module path:** `github.com/Jagtech-Services/taripay-gateway`
+- **Depends on:** `github.com/Jagtech-Services/go-tari-lib/v3` (wallet gRPC wrapper — use its `walletGRPC` package's `InitWalletGRPC`, `GetPaymentIdAddress`, `StreamTransactionEvents`, `GetCompletedTransactionsByPaymentID`, `Identify`, `GetBalances` functions; do not reimplement wallet gRPC calls here), `github.com/Jagtech-Services/go-tari-grpc-lib/v3` (transitive, for `tari_generated` types).
 - **Deployment model:** self-hosted-per-merchant by default — one gateway + one wallet per merchant, always. A merchant may have Ara/Alex (jagtech.io) administer their instance as an operational convenience, but that never means pooling multiple merchants into one wallet or one gateway process. Design as if every deploy is single-tenant, because it always is.
 
 ## Commands

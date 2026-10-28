@@ -11,11 +11,11 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	"github.com/Snipa22/go-tari-grpc-lib/v3/tari_generated"
+	"github.com/Jagtech-Services/go-tari-grpc-lib/v3/tari_generated"
 
-	"github.com/Snipa22/taripay-gateway/internal/db"
-	"github.com/Snipa22/taripay-gateway/internal/invoice"
-	"github.com/Snipa22/taripay-gateway/internal/webhook"
+	"github.com/Jagtech-Services/taripay-gateway/internal/db"
+	"github.com/Jagtech-Services/taripay-gateway/internal/invoice"
+	"github.com/Jagtech-Services/taripay-gateway/internal/webhook"
 )
 
 // setupStores connects to TARIPAY_TEST_POSTGRES_DSN, migrates a clean schema, and
