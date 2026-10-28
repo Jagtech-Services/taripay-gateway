@@ -10,7 +10,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	"github.com/Snipa22/taripay-gateway/internal/db"
+	"github.com/Jagtech-Services/taripay-gateway/internal/db"
 )
 
 // setupStore connects to TARIPAY_TEST_POSTGRES_DSN, migrates a clean schema, and

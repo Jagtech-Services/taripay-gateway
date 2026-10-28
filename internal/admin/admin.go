@@ -20,10 +20,10 @@ import (
 
 	"github.com/google/uuid"
 
-	"github.com/Snipa22/go-tari-grpc-lib/v3/tari_generated"
+	"github.com/Jagtech-Services/go-tari-grpc-lib/v3/tari_generated"
 
-	"github.com/Snipa22/taripay-gateway/internal/invoice"
-	"github.com/Snipa22/taripay-gateway/internal/webhook"
+	"github.com/Jagtech-Services/taripay-gateway/internal/invoice"
+	"github.com/Jagtech-Services/taripay-gateway/internal/webhook"
 )
 
 //go:embed templates/*.html

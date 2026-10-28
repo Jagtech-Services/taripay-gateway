@@ -20,15 +20,15 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	"github.com/Snipa22/go-tari-grpc-lib/v3/tari_generated"
-	"github.com/Snipa22/go-tari-lib/walletGRPC"
+	"github.com/Jagtech-Services/go-tari-grpc-lib/v3/tari_generated"
+	"github.com/Jagtech-Services/go-tari-lib/v3/walletGRPC"
 
-	"github.com/Snipa22/taripay-gateway/internal/admin"
-	"github.com/Snipa22/taripay-gateway/internal/config"
-	"github.com/Snipa22/taripay-gateway/internal/db"
-	"github.com/Snipa22/taripay-gateway/internal/eventwatcher"
-	"github.com/Snipa22/taripay-gateway/internal/invoice"
-	"github.com/Snipa22/taripay-gateway/internal/webhook"
+	"github.com/Jagtech-Services/taripay-gateway/internal/admin"
+	"github.com/Jagtech-Services/taripay-gateway/internal/config"
+	"github.com/Jagtech-Services/taripay-gateway/internal/db"
+	"github.com/Jagtech-Services/taripay-gateway/internal/eventwatcher"
+	"github.com/Jagtech-Services/taripay-gateway/internal/invoice"
+	"github.com/Jagtech-Services/taripay-gateway/internal/webhook"
 )
 
 // version is this binary's version stamp — the task brief part 4 (I13/I27)
